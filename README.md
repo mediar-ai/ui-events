@@ -7,16 +7,16 @@ A cross-platform Rust library designed to capture specific UI interaction events
 
 ### Motivation
 
-Understanding user interface interactions like focus shifts, window changes, and value modifications is essential for building context-aware applications, automation tools, and analytics platforms such as [[screenpipe]]. Accessing these events consistently across platforms often involves complex, platform-specific code.
+Understanding user interface interactions like focus shifts, window changes, and value modifications is essential for building context-aware AI agents, workflow recording & automation. Accessing these events consistently across platforms often involves complex, platform-specific code.
 
 `ui-events` aims to provide a performant Rust core that leverages native accessibility APIs, exposing a stream of key UI events via a simple websocket interface accessible from any language (JavaScript, Python, Go, etc.).
 
 ### Features (Based on typical `AXObserver` capabilities)
 
-*   **macOS Focus:** Captures events like application activation/deactivation, window creation/destruction/movement/resizing, focused UI element changes, and potentially value changes or selection changes within elements.
-*   **Cross-Platform Goal:** Targets macOS (initially), Windows (via UI Automation), and Linux (via AT-SPI).
+*   **UI Focus:** Captures events like application activation/deactivation, window creation/destruction/movement/resizing, focused UI element changes, and potentially value changes or selection changes within elements.
+*   **Cross-Platform Goal:** Targets macOS, Windows (via UI Automation), and Linux (via AT-SPI).
 *   **Real-time Websocket Stream:** Provides a low-latency stream of UI events over a local websocket server.
-*   **Language Agnostic:** Consumable from any language via standard websockets.
+*   **Language Agnostic:** Consumable from any language via standard websockets (or better alternative).
 *   **Performant Rust Core:** Built with Rust for efficiency and reliability.
 
 *Note: Direct capture of low-level mouse clicks or raw keyboard presses might require different OS mechanisms; `ui-events` focuses on events reported through the accessibility layer.*
