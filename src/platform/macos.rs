@@ -1,3 +1,22 @@
+/*
+This file implements the `PlatformListener` trait for macOS.
+It leverages Apple's Accessibility API (AXUIElement, AXObserver) via the `cidre` crate
+to capture UI events such as application activation, window focus changes,
+and UI element interactions (focus, value changes).
+
+Events are captured using callbacks registered with `AXObserver` on a dedicated thread
+running a `CFRunLoop`. Captured event data is then structured into a `UiEvent`
+and sent asynchronously through an `mpsc::Sender` provided during initialization.
+
+Key components:
+- `cidre`: Rust bindings for Apple frameworks (Core Foundation, AppKit, Accessibility).
+- `ax`: Accessibility API specific types within `cidre`.
+- `cf`: Core Foundation types (RunLoop, String, etc.) within `cidre`.
+- `ns`: AppKit types (Workspace, Application) within `cidre`.
+- `tokio::sync::mpsc`: Used for sending events back to the main application logic.
+- `thread_local!`: Used to store the sender and observer state within the C callback context.
+*/
+
 #![cfg(target_os = "macos")]
 
 use super::PlatformListener;
@@ -227,7 +246,7 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
 
         CURRENT_AX_OBSERVER.with(|cell| {
             if cell.borrow().is_some() {
-                debug!(pid = pid, "dropping old axobserver");
+                info!(pid = pid, "dropping old axobserver");
                 *cell.borrow_mut() = None;
             }
 
@@ -270,8 +289,6 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
         });
     });
 }
-
-// --- MacosListener Implementation ---
 
 pub struct MacosListener {}
 
