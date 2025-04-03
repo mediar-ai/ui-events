@@ -26,18 +26,22 @@ use crate::event::{
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use cidre::arc::Retained;
-use cidre::{ax, cf, ns, objc::ar_pool};
+use cidre::cf::RunLoopSrc;
+use cidre::{
+    ax, blocks, cf, ns,
+    objc::{Obj, ar_pool},
+};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-// Store sender and current observer for the CFRunLoop thread
+// Store sender and current observer setup for the CFRunLoop thread
 thread_local! {
     static SENDER: RefCell<Option<mpsc::Sender<UiEvent>>> = RefCell::new(None);
-    // Store the active AXObserver and the top-level element it observes (the app element)
-    static CURRENT_AX_OBSERVER: RefCell<Option<(Retained<ax::Observer>, Retained<ax::UiElement>)>> = RefCell::new(None);
-    // Store the NSWorkspace observer token to remove it on cleanup
+    // Store the active AXObserver, its RunLoopSource, and the element it observes
+    static CURRENT_AX_SETUP: RefCell<Option<(Retained<ax::Observer>, Retained<RunLoopSrc>, Retained<ax::UiElement>)>> = RefCell::new(None);
+    // Store the NSWorkspace observer token
     static WORKSPACE_OBSERVER_TOKEN: RefCell<Option<Retained<ns::Id>>> = RefCell::new(None);
 }
 
@@ -335,7 +339,6 @@ fn extract_event_data(
 }
 
 // Function called by NSWorkspace notification observer when an app activates
-// Changed signature to accept &ns::running_application::RunningApp
 fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::Sender<UiEvent>) {
     ar_pool(|| {
         let pid = app.pid();
@@ -358,16 +361,22 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
             error!(error = %e, "failed to send activation event");
         }
 
-        CURRENT_AX_OBSERVER.with(|cell| {
-            if cell.borrow().is_some() {
-                info!(pid = pid, "dropping old axobserver");
-                *cell.borrow_mut() = None;
+        CURRENT_AX_SETUP.with(|cell| {
+            let main_loop = cf::RunLoop::main(); // Get the main run loop
+
+            // --- Cleanup previous observer's source ---
+            if let Some((_old_observer, old_source, _old_element)) = cell.borrow_mut().take() {
+                 // Remove the old source from the main run loop
+                main_loop.remove_src(&*old_source, cf::RunLoopMode::default());
+                info!(pid = pid, "removed old axobserver source from main run loop");
+                // _old_observer and _old_element (Retained) are dropped here
+            } else {
+                info!(pid = pid, "no previous axobserver setup found to clean up.");
             }
 
-            // Get app element using pid
-            let app_element = ax::UiElement::with_app_pid(pid);
 
-            // Retry Observer::new_for_app
+            // --- Setup new observer ---
+            let app_element = ax::UiElement::with_app_pid(pid);
             match ax::Observer::with_cb(pid, observer_callback) {
                 Ok(mut observer) => { // observer should be Retained<ax::Observer>
                     info!(pid, "created new axobserver");
@@ -376,7 +385,6 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
                         ax::notification::focused_window_changed(),
                         ax::notification::focused_ui_element_changed(),
                         ax::notification::value_changed(),
-                        // Added notifications:
                         ax::notification::window_created(),
                         ax::notification::window_moved(),
                         ax::notification::window_resized(),
@@ -388,26 +396,36 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
                         ax::notification::title_changed(),
                     ];
 
+                    let mut added_count = 0;
                     for notif_name in notifications_to_add {
-                        // Observer expects &cf::String for notification name
-                        // Call add_notification on the observer instance
                         match observer.add_notification(&app_element, notif_name, std::ptr::null_mut()) {
-                            Ok(_) => info!(pid, notification = %notif_name.to_string(), "added notification"),
+                            Ok(_) => {
+                                info!(pid, notification = %notif_name.to_string(), "added notification"); // Too verbose maybe
+                                added_count += 1;
+                            },
                             Err(e) => error!(pid, notification = %notif_name.to_string(), error = ?e, "failed to add notification"),
                         }
                     }
+                    info!(pid, added_notifications = added_count, "finished adding notifications");
 
-                    // Call run_loop_source on the observer instance
-                    let source = observer.run_loop_src(); // Should be Retained<cf::RunLoopSource>
-                    // Use add_source with as_ref()
-                    cf::RunLoop::current().add_src(source, cf::RunLoopMode::default());
-                    info!(pid, "added run loop source for observer");
 
-                    // Store the observer
-                    *cell.borrow_mut() = Some((observer, app_element));
+                    // Get the run loop source for the new observer
+                    let source_ref = observer.run_loop_src(); // Get &RunLoopSrc
+                    let retained_source = source_ref.retained(); // Create Retained<RunLoopSrc> for storage
+
+                    // Add the new source to the main run loop (expects &RunLoopSrc)
+                    main_loop.add_src(source_ref, cf::RunLoopMode::default());
+                    info!(pid, "added new axobserver source to main run loop");
+
+                    // Store the new observer, its source, and the app element
+                    let retained_observer = observer.retained();
+                    let retained_app_element = app_element.retained();
+                    *cell.borrow_mut() = Some((retained_observer, retained_source, retained_app_element)); // Store the retained source
                 }
                 Err(e) => {
                     error!(pid, error = ?e, "failed to create axobserver for pid");
+                    // Ensure state is clean if observer creation fails
+                    *cell.borrow_mut() = None;
                 }
             }
         });
@@ -430,16 +448,11 @@ impl MacosListener {
 
 impl PlatformListener for MacosListener {
     fn run(&self, sender: mpsc::Sender<UiEvent>) -> Result<()> {
-        if !ax::is_process_trusted_with_prompt(true) {
-            error!("accessibility permissions not granted");
-            return Err(anyhow!("accessibility permissions not granted by user"));
-        }
         info!(
             "macos listener starting run() on thread {:?}...",
             std::thread::current().id()
         );
 
-        // Store the sender for the callbacks
         SENDER.with(|cell| {
             *cell.borrow_mut() = Some(sender.clone());
         });
@@ -447,70 +460,85 @@ impl PlatformListener for MacosListener {
 
         // --- Setup NSWorkspace Observer for App Activation ---
         let mut center = ns::Workspace::shared().notification_center();
-        let sender_callback = sender.clone();
+        let sender_callback = sender.clone(); // Clone sender for the block
 
-        // Define the callback closure for NSWorkspace notifications
-        let workspace_callback = move |notification: &ns::Notification| {
-            ar_pool(|| {
-                info!(notification_name = ?notification.name(), "received workspace notification");
-
-                let apps = ns::Workspace::shared().running_apps();
-                let active_app = apps.iter().find(|app| app.is_active()).unwrap();
-
-                handle_activation(active_app, &sender_callback);
-            });
-        }; // Copy the block to the heap
-
-        // Add the observer to the notification center
-        // TODO this does not work rn - so only recording the active app at startup
-        let token = center.add_observer(
-            // Use actual static method name for notification
-            &ns::NotificationName::with_str("NSWorkspaceDidActivateApplicationNotification"),
-            None, // Observe notifications from any object
-            None, // Pass None for OperationQueue
-            workspace_callback,
+        let mut workspace_block = blocks::SyncBlock::new1(
+            move |notification: &ns::Notification| {
+                println!("received workspace notification (block)");
+                info!(notification_name = ?notification.name(), "received workspace notification (block)");
+                let user_info = notification
+                    .user_info()
+                    .expect("notification should have user info");
+                if let Some(app_val) = user_info.get(ns::workspace::notification::app_key()) {
+                    if let Some(app) = app_val.try_cast(ns::RunningApp::cls()) {
+                        handle_activation(&app, &sender_callback);
+                    } else {
+                        error!("app_key value was not an ns::RunningApp");
+                    }
+                } else {
+                    error!("did_activate_app notification did not contain app_key");
+                }
+            },
         );
-        let retained_token = token.retained(); // Retain the token
 
-        // Store the token for cleanup
+        let token = center.add_observer_block(
+            ns::workspace::notification::did_activate_app(),
+            None,
+            None,
+            &mut workspace_block,
+        );
+
+        let retained_token = token.retained();
         WORKSPACE_OBSERVER_TOKEN.with(|cell| {
             *cell.borrow_mut() = Some(retained_token);
         });
-        info!("added ns workspace observer for app activation");
+        info!("added ns workspace observer block for app activation");
 
         // --- Initial Activation Handling ---
-        // Handle the currently active application immediately
-        let apps = ns::Workspace::shared().running_apps();
-        let active_app = apps.iter().find(|app| app.is_active()).unwrap();
+        ar_pool(|| {
+            let apps = ns::Workspace::shared().running_apps();
+            if let Some(active_app) = apps.iter().find(|app| app.is_active()) {
+                info!("handling initial active app...");
+                handle_activation(active_app, &sender);
+            } else {
+                error!("could not find initially active app");
+            }
+        });
 
-        handle_activation(&active_app, &sender);
+        // // --- Start Main App Run Loop ---
+        // info!("starting ns app run loop (blocking current thread)... Awaiting UI events.");
+        ns::App::shared().run(); // This will now process both NSWorkspace and AXObserver events
 
-        // --- Start Run Loop ---
-        info!("starting cf run loop (blocking current thread)... Awaiting UI events.");
-        cf::RunLoop::run(); // This blocks the thread
+        // --- Cleanup (Code below ns::App::shared().run() is usually not reached) ---
+        warn!("ns app run loop finished! Performing cleanup (this is unexpected).");
 
-        warn!("cf run loop finished! Performing cleanup (this is unexpected).");
-        // Cleanup for NSWorkspace observer
+        // Cleanup NSWorkspace observer
         WORKSPACE_OBSERVER_TOKEN.with(|cell| {
             if let Some(token) = cell.borrow_mut().take() {
                 ar_pool(|| {
                     ns::Workspace::shared()
                         .notification_center()
                         .remove_observer(&token);
+                    info!("removed ns workspace observer");
                 });
-                info!("removed ns workspace observer");
             }
         });
-        // Cleanup for AXObserver (managed by handle_activation, but clear it finally)
-        CURRENT_AX_OBSERVER.with(|cell| {
-            if cell.borrow().is_some() {
-                info!("dropping final axobserver during cleanup");
-                *cell.borrow_mut() = None;
+
+        // Cleanup AXObserver source from main run loop
+        CURRENT_AX_SETUP.with(|cell| {
+            if let Some((_observer, source, _element)) = cell.borrow_mut().take() {
+                ar_pool(|| {
+                    // Pool might not be strictly needed here, but safe
+                    let main_loop = cf::RunLoop::main();
+                    main_loop.remove_src(&*source, cf::RunLoopMode::default());
+                    info!("removed final axobserver source from main run loop during cleanup");
+                });
             }
         });
+
         // Cleanup sender
         SENDER.with(|cell| *cell.borrow_mut() = None);
 
-        Ok(()) // Should technically not be reached if RunLoop runs forever
+        Ok(())
     }
 }
