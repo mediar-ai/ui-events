@@ -32,15 +32,25 @@ Understanding user interface interactions like focus shifts, window changes, and
 
 ### Quick Start
 
-1.  **Install/Run the Core Service:**
+Install Rust:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+1.  **Run the Core Service:**
     ```bash
     # Build from source (ensure Rust toolchain is installed)
-    cargo build --release
-    # Run the binary (requires accessibility permissions)
-    ./target/release/ui-events
-    # Or: Instructions for pre-built binaries if available
+    cargo run
     ```
     Grant accessibility permissions when prompted by the OS. The service hosts the websocket server (default: `ws://localhost:9001` - confirm/specify port).
+
+    Run the Rust client:
+    ```bash
+    cargo run --example simple_client
+    ```
+
+    Or from other languages:
 
 2.  **Connect from Your Client:**
 
@@ -123,21 +133,11 @@ Events streamed over the websocket follow a consistent JSON structure. The exact
 ```
 *(A detailed `SCHEMA.md` should document the specific events captured on each platform)*
 
-### Supported Platforms & APIs
+### Status 
 
-*   **macOS:** [Version Range, e.g., 11.0+] (via `AXObserver` / `AppKit` Accessibility) - Status: [Developing/Experimental]
-*   **Windows:** [Version Range] (via `UI Automation`) - Status: [Planned]
-*   **Linux:** (via `AT-SPI`) - Status: [Planned]
-
-*Note: Capturing accessibility events requires user-granted permissions on all platforms.*
-
-### TODOS
-
-- [ ] Add Windows support
-- [ ] Add Linux support
-- [ ] Add documentation
-- [ ] Add tests
-- [ ] Provide serverless alternative
+- [x] experimental macOS support
+- [ ] Windows support
+- [ ] Linux support
 
 ### Contributing
 
