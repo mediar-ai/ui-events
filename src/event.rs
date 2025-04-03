@@ -8,12 +8,19 @@ pub enum EventType {
     ApplicationActivated,
     ApplicationDeactivated,
     WindowFocused,
-    // WindowCreated, // Maybe useful?
+    WindowCreated,
+    WindowMoved,
+    WindowResized,
     // WindowClosed,  // Maybe useful?
     ElementFocused,
     ValueChanged,
-    SelectionChanged, // If implemented
-                      // Add others like MenuOpened, etc. later
+    ElementDestroyed,
+    MenuOpened,
+    MenuClosed,
+    MenuItemSelected,
+    SelectionChanged,
+    SelectedTextChanged,
+    TitleChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
