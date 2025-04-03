@@ -26,18 +26,19 @@ use crate::event::{
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use cidre::arc::Retained;
-use cidre::{ax, cf, ns, objc::ar_pool};
+use cidre::cf::RunLoopSrc;
+use cidre::{ax, blocks, cf, ns, objc::Obj};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-// Store sender and current observer for the CFRunLoop thread
+// Store sender and current observer setup for the CFRunLoop thread
 thread_local! {
     static SENDER: RefCell<Option<mpsc::Sender<UiEvent>>> = RefCell::new(None);
-    // Store the active AXObserver and the top-level element it observes (the app element)
-    static CURRENT_AX_OBSERVER: RefCell<Option<(Retained<ax::Observer>, Retained<ax::UiElement>)>> = RefCell::new(None);
-    // Store the NSWorkspace observer token to remove it on cleanup
+    // Store the active AXObserver, its RunLoopSource, and the element it observes
+    static CURRENT_AX_SETUP: RefCell<Option<(Retained<ax::Observer>, Retained<RunLoopSrc>, Retained<ax::UiElement>)>> = RefCell::new(None);
+    // Store the NSWorkspace observer token
     static WORKSPACE_OBSERVER_TOKEN: RefCell<Option<Retained<ns::Id>>> = RefCell::new(None);
 }
 
@@ -51,193 +52,182 @@ extern "C" fn observer_callback(
     notification: &ax::Notification,
     _user_info: *mut c_void,
 ) {
-    ar_pool(|| {
-        // Directly use the Ref, or retain if ownership/longer lifetime is needed
-        let element = element.retained();
-        let notification = notification.retained();
-        let notification_name = notification.to_string();
+    // Directly use the Ref, or retain if ownership/longer lifetime is needed
+    let element = element.retained();
+    let notification = notification.retained();
+    let notification_name = notification.to_string();
 
-        info!(%notification_name, "observer_callback received");
+    info!(%notification_name, "observer_callback received");
 
-        SENDER.with(|cell| {
-            let r = cell.borrow();
-            let sender = match r.as_ref() {
-                Some(s) => s,
-                None => {
-                    error!("sender not available in observer callback");
-                    return;
-                }
-            };
-
-            // Map AX notifications (cf::String constants) to our event types
-            let event_type = if notification.equal(ax::notification::focused_window_changed()) {
-                EventType::WindowFocused
-            } else if notification.equal(ax::notification::focused_ui_element_changed()) {
-                EventType::ElementFocused
-            } else if notification.equal(ax::notification::value_changed()) {
-                EventType::ValueChanged
-            } else if notification.equal(ax::notification::window_created()) {
-                EventType::WindowCreated
-            } else if notification.equal(ax::notification::window_moved()) {
-                EventType::WindowMoved
-            } else if notification.equal(ax::notification::window_resized()) {
-                EventType::WindowResized
-            } else if notification.equal(ax::notification::ui_element_destroyed()) {
-                EventType::ElementDestroyed
-            } else if notification.equal(ax::notification::menu_opened()) {
-                EventType::MenuOpened
-            } else if notification.equal(ax::notification::menu_closed()) {
-                EventType::MenuClosed
-            } else if notification.equal(ax::notification::menu_item_selected()) {
-                EventType::MenuItemSelected
-            } else if notification.equal(ax::notification::selected_text_changed()) {
-                EventType::SelectedTextChanged
-            } else if notification.equal(ax::notification::title_changed()) {
-                EventType::TitleChanged
-            } else {
-                info!(%notification_name, "ignoring unhandled ax notification");
+    SENDER.with(|cell| {
+        let r = cell.borrow();
+        let sender = match r.as_ref() {
+            Some(s) => s,
+            None => {
+                error!("sender not available in observer callback");
                 return;
-            };
-
-            // Extract contextual data from the element
-            match extract_event_data(&element) {
-                Ok((app_info, window_info, element_details)) => {
-                    let event = UiEvent {
-                        event_type,
-                        timestamp: Utc::now(),
-                        application: app_info,
-                        window: window_info,
-                        element: element_details,
-                        event_specific_data: None, // Populate if needed
-                    };
-
-                    // Send the event (non-blocking)
-                    if let Err(e) = sender.try_send(event) {
-                        error!(error = %e, "failed to send event from callback");
-                    }
-
-                    info!(%notification_name, "event sent");
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to extract event data in callback");
-                }
             }
-        });
+        };
+
+        // Map AX notifications (cf::String constants) to our event types
+        let event_type = if notification.equal(ax::notification::focused_window_changed()) {
+            EventType::WindowFocused
+        } else if notification.equal(ax::notification::focused_ui_element_changed()) {
+            EventType::ElementFocused
+        } else if notification.equal(ax::notification::value_changed()) {
+            EventType::ValueChanged
+        } else if notification.equal(ax::notification::window_created()) {
+            EventType::WindowCreated
+        } else if notification.equal(ax::notification::window_moved()) {
+            EventType::WindowMoved
+        } else if notification.equal(ax::notification::window_resized()) {
+            EventType::WindowResized
+        } else if notification.equal(ax::notification::ui_element_destroyed()) {
+            EventType::ElementDestroyed
+        } else if notification.equal(ax::notification::menu_opened()) {
+            EventType::MenuOpened
+        } else if notification.equal(ax::notification::menu_closed()) {
+            EventType::MenuClosed
+        } else if notification.equal(ax::notification::menu_item_selected()) {
+            EventType::MenuItemSelected
+        } else if notification.equal(ax::notification::selected_text_changed()) {
+            EventType::SelectedTextChanged
+        } else if notification.equal(ax::notification::title_changed()) {
+            EventType::TitleChanged
+        } else {
+            info!(%notification_name, "ignoring unhandled ax notification");
+            return;
+        };
+
+        // Extract contextual data from the element
+        match extract_event_data(&element) {
+            Ok((app_info, window_info, element_details)) => {
+                let event = UiEvent {
+                    event_type,
+                    timestamp: Utc::now(),
+                    application: app_info,
+                    window: window_info,
+                    element: element_details,
+                    event_specific_data: None, // Populate if needed
+                };
+
+                // Send the event (non-blocking)
+                if let Err(e) = sender.try_send(event) {
+                    error!(error = %e, "failed to send event from callback");
+                }
+
+                info!(%notification_name, "event sent");
+            }
+            Err(e) => {
+                error!(error = %e, "failed to extract event data in callback");
+            }
+        }
     });
 }
 
 // Convert common CF types to serde_json::Value
 fn cf_value_to_json(cf_value: &cf::Type) -> Option<serde_json::Value> {
-    ar_pool(|| {
-        let type_id = cf_value.get_type_id();
-        // Remove Ok wrapping, return Option directly
-        if type_id == cf::String::type_id() {
-            let s_ptr = cf_value as *const cf::Type as *const cf::String;
-            Some(serde_json::Value::String(unsafe { &*s_ptr }.to_string()))
-        } else if type_id == cf::Number::type_id() {
-            let n_ptr = cf_value as *const cf::Type as *const cf::Number;
-            let n_number = unsafe { &*n_ptr };
-            if n_number.is_float_type() {
-                n_number
-                    .to_f64()
-                    .and_then(|f| serde_json::Number::from_f64(f))
-                    .map(serde_json::Value::Number)
-            } else {
-                n_number
-                    .to_i64()
-                    .map(|i| i.into())
-                    .map(serde_json::Value::Number)
-            }
-        } else if type_id == cf::Boolean::type_id() {
-            let b_ptr = cf_value as *const cf::Type as *const cf::Boolean;
-            Some(serde_json::json!(unsafe { &*b_ptr }.value()))
-        } else if type_id == cf::Date::type_id() {
-            let d_ptr = cf_value as *const cf::Type as *const cf::Date;
-            let d_date = unsafe { &*d_ptr };
-            let abs_time = d_date.abs_time(); // f64 seconds since epoch
-            let unix_timestamp_secs = CF_ABSOLUTE_TIME_EPOCH_OFFSET + abs_time as i64;
-            let unix_timestamp_nanos = (abs_time.fract() * 1_000_000_000.0) as u32;
-            // Use Option chaining instead of match
-            chrono::DateTime::from_timestamp(unix_timestamp_secs, unix_timestamp_nanos)
-                .map(|datetime| serde_json::json!(datetime.to_rfc3339()))
+    let type_id = cf_value.get_type_id();
+    // Remove Ok wrapping, return Option directly
+    if type_id == cf::String::type_id() {
+        let s_ptr = cf_value as *const cf::Type as *const cf::String;
+        Some(serde_json::Value::String(unsafe { &*s_ptr }.to_string()))
+    } else if type_id == cf::Number::type_id() {
+        let n_ptr = cf_value as *const cf::Type as *const cf::Number;
+        let n_number = unsafe { &*n_ptr };
+        if n_number.is_float_type() {
+            n_number
+                .to_f64()
+                .and_then(|f| serde_json::Number::from_f64(f))
+                .map(serde_json::Value::Number)
         } else {
-            warn!(cf_type_id = type_id, description = ?cf_value.desc(), "unhandled cf type for element value");
+            n_number
+                .to_i64()
+                .map(|i| i.into())
+                .map(serde_json::Value::Number)
+        }
+    } else if type_id == cf::Boolean::type_id() {
+        let b_ptr = cf_value as *const cf::Type as *const cf::Boolean;
+        Some(serde_json::json!(unsafe { &*b_ptr }.value()))
+    } else if type_id == cf::Date::type_id() {
+        let d_ptr = cf_value as *const cf::Type as *const cf::Date;
+        let d_date = unsafe { &*d_ptr };
+        let abs_time = d_date.abs_time(); // f64 seconds since epoch
+        let unix_timestamp_secs = CF_ABSOLUTE_TIME_EPOCH_OFFSET + abs_time as i64;
+        let unix_timestamp_nanos = (abs_time.fract() * 1_000_000_000.0) as u32;
+        // Use Option chaining instead of match
+        chrono::DateTime::from_timestamp(unix_timestamp_secs, unix_timestamp_nanos)
+            .map(|datetime| serde_json::json!(datetime.to_rfc3339()))
+    } else {
+        warn!(cf_type_id = type_id, description = ?cf_value.desc(), "unhandled cf type for element value");
+        None
+    }
+}
+
+// Helper to safely get a string attribute from an AXUIElement
+fn get_string_attribute(element: &ax::UiElement, attribute: &ax::Attr) -> Option<String> {
+    element.attr_value(attribute).ok().and_then(|val| {
+        if val.get_type_id() == cf::String::type_id() {
+            let s_ptr = &*val as *const cf::Type as *const cf::String;
+            let string = unsafe { &*s_ptr }.to_string();
+            if !string.is_empty() {
+                Some(string)
+            } else {
+                None
+            }
+        } else {
             None
         }
     })
 }
 
-// Helper to safely get a string attribute from an AXUIElement
-fn get_string_attribute(element: &ax::UiElement, attribute: &ax::Attr) -> Option<String> {
-    ar_pool(|| {
-        element.attr_value(attribute).ok().and_then(|val| {
-            if val.get_type_id() == cf::String::type_id() {
-                let s_ptr = &*val as *const cf::Type as *const cf::String;
-                let string = unsafe { &*s_ptr }.to_string();
-                if !string.is_empty() {
-                    Some(string)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-    })
-}
-
 // Helper to get position
 fn get_element_position(element: &ax::UiElement) -> Option<Position> {
-    ar_pool(|| {
-        element.attr_value(ax::attr::pos()).ok().and_then(|val| {
-            // Check if the value is an AXValue encoding a CGPoint
-            if val.get_type_id() == ax::Value::type_id() {
-                let value_ptr = &*val as *const cf::Type as *const ax::Value;
-                let ax_value = unsafe { &*value_ptr };
-                // Use cg_point() and rely on get_value's return
-                if let Some(point) = ax_value.cg_point() {
-                    Some(Position {
-                        x: point.x,
-                        y: point.y,
-                    })
-                } else {
-                    // warn!("failed to extract cg_point or wrong type");
-                    None
-                }
+    element.attr_value(ax::attr::pos()).ok().and_then(|val| {
+        // Check if the value is an AXValue encoding a CGPoint
+        if val.get_type_id() == ax::Value::type_id() {
+            let value_ptr = &*val as *const cf::Type as *const ax::Value;
+            let ax_value = unsafe { &*value_ptr };
+            // Use cg_point() and rely on get_value's return
+            if let Some(point) = ax_value.cg_point() {
+                Some(Position {
+                    x: point.x,
+                    y: point.y,
+                })
             } else {
-                // warn!("attribute was not ax_value, type_id: {}", val.get_type_id());
+                // warn!("failed to extract cg_point or wrong type");
                 None
             }
-        })
+        } else {
+            // warn!("attribute was not ax_value, type_id: {}", val.get_type_id());
+            None
+        }
     })
 }
 
 // Helper to get size
 fn get_element_size(element: &ax::UiElement) -> Option<Size> {
-    ar_pool(|| {
-        element.attr_value(ax::attr::size()).ok().and_then(|val| {
-            if val.get_type_id() == ax::Value::type_id() {
-                let value_ptr = &*val as *const cf::Type as *const ax::Value;
-                let ax_value = unsafe { &*value_ptr };
-                // Use cg_size() and rely on get_value's return
-                if let Some(size) = ax_value.cg_size() {
-                    Some(Size {
-                        width: size.width,
-                        height: size.height,
-                    })
-                } else {
-                    // warn!("failed to extract cg_size or wrong type");
-                    None
-                }
+    element.attr_value(ax::attr::size()).ok().and_then(|val| {
+        if val.get_type_id() == ax::Value::type_id() {
+            let value_ptr = &*val as *const cf::Type as *const ax::Value;
+            let ax_value = unsafe { &*value_ptr };
+            // Use cg_size() and rely on get_value's return
+            if let Some(size) = ax_value.cg_size() {
+                Some(Size {
+                    width: size.width,
+                    height: size.height,
+                })
             } else {
-                //    warn!("attribute was not ax_value, type_id: {}", val.get_type_id());
+                // warn!("failed to extract cg_size or wrong type");
                 None
             }
-        })
+        } else {
+            //    warn!("attribute was not ax_value, type_id: {}", val.get_type_id());
+            None
+        }
     })
 }
 
-// Enhanced helper - NOT wrapped entirely in ar_pool anymore
 fn extract_event_data(
     element: &ax::UiElement,
 ) -> Result<(
@@ -249,20 +239,17 @@ fn extract_event_data(
 
     // --- Application Info ---
     let app_info: Option<ApplicationInfo> = pid.and_then(|p| {
-        ar_pool(|| {
-            // Pool for NS object access
-            let app = ns::running_application::RunningApp::with_pid(p);
-            let app_name = app.and_then(|a| a.localized_name()).map(|s| s.to_string());
-            Some(ApplicationInfo {
-                name: app_name,
-                pid: Some(p),
-            })
+        // Pool for NS object access
+        let app = ns::running_application::RunningApp::with_pid(p);
+        let app_name = app.and_then(|a| a.localized_name()).map(|s| s.to_string());
+        Some(ApplicationInfo {
+            name: app_name,
+            pid: Some(p),
         })
     });
 
     // --- Window Info ---
-    // ar_pool might be needed here due to element access & retention
-    let window_info: Option<WindowInfo> = ar_pool(|| {
+    let window_info: Option<WindowInfo> = {
         // 1. Check if the element itself is the window
         let mut window_element = element
             .role()
@@ -306,20 +293,17 @@ fn extract_event_data(
             Some(WindowInfo { title, id: None })
             // Note: win (Retained<UiElement>) goes out of scope here, pool handles release
         })
-    });
+    };
 
     // --- Element Details ---
-    // These helpers use ar_pool internally
-    let role = ar_pool(|| element.role().map(|r| r.to_string()).ok());
+    let role = element.role().map(|r| r.to_string()).ok();
     let identifier = get_string_attribute(element, ax::attr::title())
         .or_else(|| get_string_attribute(element, ax::attr::desc()))
         .or_else(|| get_string_attribute(element, ax::attr::help()));
-    let value = ar_pool(|| {
-        element
-            .attr_value(ax::attr::value())
-            .ok()
-            .and_then(|cf_val| cf_value_to_json(&*cf_val))
-    });
+    let value = element
+        .attr_value(ax::attr::value())
+        .ok()
+        .and_then(|cf_val| cf_value_to_json(&*cf_val));
     let position = get_element_position(element);
     let size = get_element_size(element);
 
@@ -331,43 +315,47 @@ fn extract_event_data(
         size,
     };
 
-    Ok((app_info, window_info, Some(element_details))) // Final Result constructed outside ar_pool
+    Ok((app_info, window_info, Some(element_details)))
 }
 
 // Function called by NSWorkspace notification observer when an app activates
-// Changed signature to accept &ns::running_application::RunningApp
 fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::Sender<UiEvent>) {
-    ar_pool(|| {
-        let pid = app.pid();
-        let app_name = app.localized_name().map(|s| s.to_string());
-        info!(app_name = ?app_name, pid, "activated app");
+    let pid = app.pid();
+    let app_name = app.localized_name().map(|s| s.to_string());
+    info!(app_name = ?app_name, pid, "activated app");
 
-        // --- Send ApplicationActivated Event ---
-        let event = UiEvent {
-            event_type: EventType::ApplicationActivated,
-            timestamp: Utc::now(),
-            application: Some(ApplicationInfo {
-                name: app_name.clone(),
-                pid: Some(pid),
-            }),
-            window: None,
-            element: None,
-            event_specific_data: None,
-        };
-        if let Err(e) = sender.try_send(event) {
-            error!(error = %e, "failed to send activation event");
-        }
+    // --- Send ApplicationActivated Event ---
+    let event = UiEvent {
+        event_type: EventType::ApplicationActivated,
+        timestamp: Utc::now(),
+        application: Some(ApplicationInfo {
+            name: app_name.clone(),
+            pid: Some(pid),
+        }),
+        window: None,
+        element: None,
+        event_specific_data: None,
+    };
+    if let Err(e) = sender.try_send(event) {
+        error!(error = %e, "failed to send activation event");
+    }
 
-        CURRENT_AX_OBSERVER.with(|cell| {
-            if cell.borrow().is_some() {
-                info!(pid = pid, "dropping old axobserver");
-                *cell.borrow_mut() = None;
+    CURRENT_AX_SETUP.with(|cell| {
+            let main_loop = cf::RunLoop::main(); // Get the main run loop
+
+            // --- Cleanup previous observer's source ---
+            if let Some((_old_observer, old_source, _old_element)) = cell.borrow_mut().take() {
+                 // Remove the old source from the main run loop
+                main_loop.remove_src(&*old_source, cf::RunLoopMode::default());
+                info!(pid = pid, "removed old axobserver source from main run loop");
+                // _old_observer and _old_element (Retained) are dropped here
+            } else {
+                info!(pid = pid, "no previous axobserver setup found to clean up.");
             }
 
-            // Get app element using pid
-            let app_element = ax::UiElement::with_app_pid(pid);
 
-            // Retry Observer::new_for_app
+            // --- Setup new observer ---
+            let app_element = ax::UiElement::with_app_pid(pid);
             match ax::Observer::with_cb(pid, observer_callback) {
                 Ok(mut observer) => { // observer should be Retained<ax::Observer>
                     info!(pid, "created new axobserver");
@@ -376,7 +364,6 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
                         ax::notification::focused_window_changed(),
                         ax::notification::focused_ui_element_changed(),
                         ax::notification::value_changed(),
-                        // Added notifications:
                         ax::notification::window_created(),
                         ax::notification::window_moved(),
                         ax::notification::window_resized(),
@@ -388,30 +375,39 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
                         ax::notification::title_changed(),
                     ];
 
+                    let mut added_count = 0;
                     for notif_name in notifications_to_add {
-                        // Observer expects &cf::String for notification name
-                        // Call add_notification on the observer instance
                         match observer.add_notification(&app_element, notif_name, std::ptr::null_mut()) {
-                            Ok(_) => info!(pid, notification = %notif_name.to_string(), "added notification"),
+                            Ok(_) => {
+                                info!(pid, notification = %notif_name.to_string(), "added notification"); // Too verbose maybe
+                                added_count += 1;
+                            },
                             Err(e) => error!(pid, notification = %notif_name.to_string(), error = ?e, "failed to add notification"),
                         }
                     }
+                    info!(pid, added_notifications = added_count, "finished adding notifications");
 
-                    // Call run_loop_source on the observer instance
-                    let source = observer.run_loop_src(); // Should be Retained<cf::RunLoopSource>
-                    // Use add_source with as_ref()
-                    cf::RunLoop::current().add_src(source, cf::RunLoopMode::default());
-                    info!(pid, "added run loop source for observer");
 
-                    // Store the observer
-                    *cell.borrow_mut() = Some((observer, app_element));
+                    // Get the run loop source for the new observer
+                    let source_ref = observer.run_loop_src(); // Get &RunLoopSrc
+                    let retained_source = source_ref.retained(); // Create Retained<RunLoopSrc> for storage
+
+                    // Add the new source to the main run loop (expects &RunLoopSrc)
+                    main_loop.add_src(source_ref, cf::RunLoopMode::default());
+                    info!(pid, "added new axobserver source to main run loop");
+
+                    // Store the new observer, its source, and the app element
+                    let retained_observer = observer.retained();
+                    let retained_app_element = app_element.retained();
+                    *cell.borrow_mut() = Some((retained_observer, retained_source, retained_app_element)); // Store the retained source
                 }
                 Err(e) => {
                     error!(pid, error = ?e, "failed to create axobserver for pid");
+                    // Ensure state is clean if observer creation fails
+                    *cell.borrow_mut() = None;
                 }
             }
         });
-    });
 }
 
 pub struct MacosListener {}
@@ -430,16 +426,11 @@ impl MacosListener {
 
 impl PlatformListener for MacosListener {
     fn run(&self, sender: mpsc::Sender<UiEvent>) -> Result<()> {
-        if !ax::is_process_trusted_with_prompt(true) {
-            error!("accessibility permissions not granted");
-            return Err(anyhow!("accessibility permissions not granted by user"));
-        }
         info!(
             "macos listener starting run() on thread {:?}...",
             std::thread::current().id()
         );
 
-        // Store the sender for the callbacks
         SENDER.with(|cell| {
             *cell.borrow_mut() = Some(sender.clone());
         });
@@ -447,70 +438,79 @@ impl PlatformListener for MacosListener {
 
         // --- Setup NSWorkspace Observer for App Activation ---
         let mut center = ns::Workspace::shared().notification_center();
-        let sender_callback = sender.clone();
+        let sender_callback = sender.clone(); // Clone sender for the block
 
-        // Define the callback closure for NSWorkspace notifications
-        let workspace_callback = move |notification: &ns::Notification| {
-            ar_pool(|| {
-                info!(notification_name = ?notification.name(), "received workspace notification");
-
-                let apps = ns::Workspace::shared().running_apps();
-                let active_app = apps.iter().find(|app| app.is_active()).unwrap();
-
-                handle_activation(active_app, &sender_callback);
-            });
-        }; // Copy the block to the heap
-
-        // Add the observer to the notification center
-        // TODO this does not work rn - so only recording the active app at startup
-        let token = center.add_observer(
-            // Use actual static method name for notification
-            &ns::NotificationName::with_str("NSWorkspaceDidActivateApplicationNotification"),
-            None, // Observe notifications from any object
-            None, // Pass None for OperationQueue
-            workspace_callback,
+        let mut workspace_block = blocks::SyncBlock::new1(
+            move |notification: &ns::Notification| {
+                println!("received workspace notification (block)");
+                info!(notification_name = ?notification.name(), "received workspace notification (block)");
+                let user_info = notification
+                    .user_info()
+                    .expect("notification should have user info");
+                if let Some(app_val) = user_info.get(ns::workspace::notification::app_key()) {
+                    if let Some(app) = app_val.try_cast(ns::RunningApp::cls()) {
+                        handle_activation(&app, &sender_callback);
+                    } else {
+                        error!("app_key value was not an ns::RunningApp");
+                    }
+                } else {
+                    error!("did_activate_app notification did not contain app_key");
+                }
+            },
         );
-        let retained_token = token.retained(); // Retain the token
 
-        // Store the token for cleanup
+        let token = center.add_observer_block(
+            ns::workspace::notification::did_activate_app(),
+            None,
+            None,
+            &mut workspace_block,
+        );
+
+        let retained_token = token.retained();
         WORKSPACE_OBSERVER_TOKEN.with(|cell| {
             *cell.borrow_mut() = Some(retained_token);
         });
-        info!("added ns workspace observer for app activation");
+        info!("added ns workspace observer block for app activation");
 
         // --- Initial Activation Handling ---
-        // Handle the currently active application immediately
         let apps = ns::Workspace::shared().running_apps();
-        let active_app = apps.iter().find(|app| app.is_active()).unwrap();
+        if let Some(active_app) = apps.iter().find(|app| app.is_active()) {
+            info!("handling initial active app...");
+            handle_activation(active_app, &sender);
+        } else {
+            error!("could not find initially active app");
+        }
 
-        handle_activation(&active_app, &sender);
+        // // --- Start Main App Run Loop ---
+        info!("starting ns app run loop (blocking current thread)... Awaiting UI events.");
+        ns::App::shared().run(); // This will now process both NSWorkspace and AXObserver events
 
-        // --- Start Run Loop ---
-        info!("starting cf run loop (blocking current thread)... Awaiting UI events.");
-        cf::RunLoop::run(); // This blocks the thread
+        // --- Cleanup ---
+        warn!("ns app run loop finished! Performing cleanup (this is unexpected).");
 
-        warn!("cf run loop finished! Performing cleanup (this is unexpected).");
-        // Cleanup for NSWorkspace observer
+        // Cleanup NSWorkspace observer
         WORKSPACE_OBSERVER_TOKEN.with(|cell| {
             if let Some(token) = cell.borrow_mut().take() {
-                ar_pool(|| {
-                    ns::Workspace::shared()
-                        .notification_center()
-                        .remove_observer(&token);
-                });
+                ns::Workspace::shared()
+                    .notification_center()
+                    .remove_observer(&token);
                 info!("removed ns workspace observer");
             }
         });
-        // Cleanup for AXObserver (managed by handle_activation, but clear it finally)
-        CURRENT_AX_OBSERVER.with(|cell| {
-            if cell.borrow().is_some() {
-                info!("dropping final axobserver during cleanup");
-                *cell.borrow_mut() = None;
+
+        // Cleanup AXObserver source from main run loop
+        CURRENT_AX_SETUP.with(|cell| {
+            if let Some((_observer, source, _element)) = cell.borrow_mut().take() {
+                // Pool might not be strictly needed here, but safe
+                let main_loop = cf::RunLoop::main();
+                main_loop.remove_src(&*source, cf::RunLoopMode::default());
+                info!("removed final axobserver source from main run loop during cleanup");
             }
         });
+
         // Cleanup sender
         SENDER.with(|cell| *cell.borrow_mut() = None);
 
-        Ok(()) // Should technically not be reached if RunLoop runs forever
+        Ok(())
     }
 }
