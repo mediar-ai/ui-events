@@ -5,6 +5,8 @@
 
 A cross-platform Rust library designed to capture specific UI interaction events using native operating system accessibility APIs (initially focusing on macOS `AXObserver` capabilities, with planned support for Windows UI Automation and Linux AT-SPI) and stream them over a websocket connection.
 
+https://github.com/user-attachments/assets/aed073e4-ec4e-403b-872e-270e0c4802b5
+
 ### Motivation
 
 Understanding user interface interactions like focus shifts, window changes, and value modifications is essential for building context-aware AI agents, workflow recording & automation. Accessing these events consistently across platforms often involves complex, platform-specific code.
