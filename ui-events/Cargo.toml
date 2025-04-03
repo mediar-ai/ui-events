@@ -1,0 +1,31 @@
+[package]
+name = "ui-events"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] } # Use "full" for mpsc, rt-multi-thread, macros
+tokio-tungstenite = "0.21" # Or other websocket library like axum
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+futures-util = "0.3"
+
+[dev-dependencies]
+# Added for example client
+futures-util = "0.3"
+url = "2.5"
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre = { git = "https://github.com/yury/cidre", rev = "42ed422", features = ["ax", "ns", "cf", "blocks", "app"] }
+chrono = { version = "0.4", features = ["serde"] } # For timestamps
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Add Windows UI Automation crate(s) here later (e.g., windows-rs, uiautomation)
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Add Linux AT-SPI crate(s) here later (e.g., zbus, atspi)

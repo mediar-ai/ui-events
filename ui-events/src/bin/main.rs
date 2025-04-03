@@ -2,14 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use tokio::sync::mpsc;
 
-mod error;
-mod event;
-mod platform;
-mod server;
-
-use platform::create_listener;
-use server::run_server;
 use tracing::{error, info};
+use ui_events::platform::create_listener;
+use ui_events::server::run_server;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
