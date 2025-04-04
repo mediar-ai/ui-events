@@ -25,10 +25,14 @@ use crate::event::{
 };
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use cidre::arc::Retained;
+use cidre::arc::{self, Retained};
+use cidre::objc::Obj;
 use cidre::{ax, cf, ns, objc::ar_pool};
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::marker::PhantomPinned;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -43,6 +47,16 @@ thread_local! {
 
 // Define the reference date epoch seconds (Unix timestamp for 2001-01-01T00:00:00Z)
 const CF_ABSOLUTE_TIME_EPOCH_OFFSET: i64 = 978307200;
+
+extern "C" fn observer_callback2(
+    _observer: &mut ax::Observer,
+    element: &mut ax::UiElement,
+    notification: &ax::Notification,
+    user_info: *mut c_void,
+) {
+    let listener: &MacosListener = unsafe { std::mem::transmute(user_info) };
+    listener.handle_ui_event(element, notification);
+}
 
 // The C callback function for AXObserver notifications
 extern "C" fn observer_callback(
@@ -399,6 +413,7 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
 
                     // Call run_loop_source on the observer instance
                     let source = observer.run_loop_src(); // Should be Retained<cf::RunLoopSource>
+                    source.invalidate();
                     // Use add_source with as_ref()
                     cf::RunLoop::current().add_src(source, cf::RunLoopMode::default());
                     info!(pid, "added run loop source for observer");
@@ -414,17 +429,200 @@ fn handle_activation(app: &ns::running_application::RunningApp, sender: &mpsc::S
     });
 }
 
-pub struct MacosListener {}
+pub struct MacosListener {
+    tx: mpsc::Sender<UiEvent>,
+    ax_observer: Mutex<Option<arc::R<ax::Observer>>>,
+    ws_observer_token: Mutex<Option<arc::R<ns::Id>>>,
+    // self reference pointer
+    ptr: *mut std::ffi::c_void,
+    _pin: PhantomPinned,
+}
+
+// all processing on main thread
+unsafe impl Send for MacosListener {}
+unsafe impl Sync for MacosListener {}
 
 impl MacosListener {
-    pub fn new() -> Result<Self> {
+    fn handle_ui_event(&self, element: &mut ax::UiElement, n: &ax::Notification) {
+        // Map AX notifications (cf::String constants) to our event types
+        use ax::notification as axn;
+        let event_type = match () {
+            _ if n == axn::focused_window_changed() => EventType::WindowFocused,
+            _ if n == axn::focused_ui_element_changed() => EventType::ElementFocused,
+            _ if n == axn::value_changed() => EventType::ValueChanged,
+            _ if n == axn::window_created() => EventType::WindowCreated,
+            _ if n == axn::window_moved() => EventType::WindowMoved,
+            _ if n == axn::window_resized() => EventType::WindowResized,
+            _ if n == axn::ui_element_destroyed() => EventType::ElementDestroyed,
+            _ if n == axn::menu_opened() => EventType::MenuOpened,
+            _ if n == axn::menu_closed() => EventType::MenuClosed,
+            _ if n == axn::menu_item_selected() => EventType::MenuItemSelected,
+            _ if n == axn::selected_text_changed() => EventType::SelectedTextChanged,
+            _ if n == axn::title_changed() => EventType::TitleChanged,
+            _ => return,
+        };
+
+        // Extract contextual data from the element
+        match extract_event_data(&element) {
+            Ok((app_info, window_info, element_details)) => {
+                let event = UiEvent {
+                    event_type,
+                    timestamp: Utc::now(),
+                    application: app_info,
+                    window: window_info,
+                    element: element_details,
+                    event_specific_data: None, // Populate if needed
+                };
+
+                println!("{event:?}");
+
+                // Send the event (non-blocking)
+                if let Err(e) = self.tx.try_send(event) {
+                    error!(error = %e, "failed to send event from callback");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to extract event data in callback");
+            }
+        }
+    }
+
+    #[inline]
+    fn handle_app_activation(self: &Pin<Arc<Self>>, n: &ns::Notification) {
+        let Some(user_info) = n.user_info() else {
+            return println!("no user info");
+        };
+        let Some(app) = user_info.get(ns::workspace::notification::app_key()) else {
+            return println!("no active app");
+        };
+
+        let Some(app) = app.try_cast(ns::RunningApp::cls()) else {
+            return println!("wrong app class");
+        };
+
+        let pid = app.pid();
+
+        let app_name = app.localized_name().map(|s| s.to_string());
+        info!(app_name = ?app_name, pid, "activated app");
+
+        // --- Send ApplicationActivated Event ---
+        let event = UiEvent {
+            event_type: EventType::ApplicationActivated,
+            timestamp: Utc::now(),
+            application: Some(ApplicationInfo {
+                name: app_name,
+                pid: Some(pid),
+            }),
+            window: None,
+            element: None,
+            event_specific_data: None,
+        };
+        if let Err(e) = self.tx.try_send(event) {
+            error!(error = %e, "failed to send activation event");
+        }
+
+        {
+            // release current observer
+            self.ax_observer.lock().unwrap().take();
+        }
+
+        let app_element = ax::UiElement::with_app_pid(pid);
+
+        // Retry Observer::new_for_app
+        match ax::Observer::with_cb(pid, observer_callback2) {
+            Ok(mut observer) => {
+                // observer should be Retained<ax::Observer>
+                info!(pid, "created new axobserver");
+                use ax::notification as axn;
+                let notifications_to_add = [
+                    axn::focused_window_changed(),
+                    axn::focused_ui_element_changed(),
+                    axn::value_changed(),
+                    // Added notifications:
+                    axn::window_created(),
+                    axn::window_moved(),
+                    axn::window_resized(),
+                    axn::ui_element_destroyed(),
+                    axn::menu_opened(),
+                    axn::menu_closed(),
+                    axn::menu_item_selected(),
+                    axn::selected_text_changed(),
+                    axn::title_changed(),
+                ];
+
+                for notif_name in notifications_to_add {
+                    // Observer expects &cf::String for notification name
+                    // Call add_notification on the observer instance
+                    match observer.add_notification(&app_element, notif_name, self.ptr) {
+                        Ok(_) => {
+                            info!(pid, notification = %notif_name.to_string(), "added notification")
+                        }
+                        Err(e) => {
+                            error!(pid, notification = %notif_name.to_string(), error = ?e, "failed to add notification")
+                        }
+                    }
+                }
+
+                // Call run_loop_source on the observer instance
+                let source = observer.run_loop_src(); // Should be Retained<cf::RunLoopSource>
+                // Reply to comment above: No, it is get rule there
+                cf::RunLoop::main().add_src(source, cf::RunLoopMode::default());
+                info!(pid, "added run loop source for observer");
+
+                // Store the observer
+                {
+                    // lock scope
+                    let _ = self.ax_observer.lock().unwrap().insert(observer);
+                }
+            }
+            Err(e) => {
+                error!(pid, error = ?e, "failed to create axobserver for pid");
+            }
+        }
+    }
+
+    pub fn new_on_main_thread(tx: mpsc::Sender<UiEvent>) -> Result<Pin<Arc<Self>>> {
+        debug_assert!(ns::Thread::is_main());
+        // TODO: assert on main thread
         info!("checking accessibility permissions...");
         if !ax::is_process_trusted_with_prompt(true) {
             error!("accessibility permissions not granted");
             return Err(anyhow!("accessibility permissions not granted by user"));
         }
-        info!("accessibility permissions granted");
-        Ok(Self {})
+
+        let data = Self {
+            tx,
+            ax_observer: Default::default(),
+            ws_observer_token: Default::default(),
+            ptr: std::ptr::null_mut(),
+            _pin: PhantomPinned,
+        };
+
+        let pin = unsafe {
+            let mut arc = std::sync::Arc::new(data);
+            let data = Arc::get_mut(&mut arc).unwrap_unchecked();
+            data.ptr = data as *const Self as *mut _;
+            Pin::new_unchecked(arc)
+        };
+
+        let block_pin = pin.clone();
+
+        let mut nc = ns::Workspace::shared().notification_center();
+        let token = nc.add_observer(
+            ns::workspace::notification::did_activate_app(),
+            None,
+            None,
+            move |n: &ns::Notification| {
+                block_pin.handle_app_activation(n);
+            },
+        );
+
+        {
+            // lock scope
+            let _ = pin.ws_observer_token.lock().unwrap().insert(token);
+        }
+
+        Ok(pin)
     }
 }
 

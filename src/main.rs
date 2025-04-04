@@ -1,4 +1,5 @@
 use anyhow::Result;
+use cidre::ns;
 use clap::Parser;
 use tokio::sync::mpsc;
 
@@ -19,46 +20,26 @@ struct Args {
     port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// #[tokio::main]
+fn main() {
     tracing_subscriber::fmt::init();
     info!("starting ui-events...");
 
-    let args = Args::parse();
+    let port = Args::parse().port;
 
     // Create a channel for communication between listener and server
     let (tx, rx) = mpsc::channel(100); // Buffer size 100
 
-    // Create and run the platform-specific listener
-    // Note: The listener's run method might be blocking (e.g., for CFRunLoop on macOS)
-    // So we run it in a separate blocking task/thread.
-    let listener = create_listener()?;
-    let listener_handle = tokio::task::spawn_blocking(move || {
-        if let Err(e) = listener.run(tx) {
-            error!("listener error: {}", e); // Use proper logging
-        }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    rt.spawn(async move {
+        run_server(port, rx).await.unwrap();
+        ns::App::shared().terminate(None);
     });
 
-    // Run the WebSocket server
-    let server_handle = run_server(args.port, rx);
-
-    // Keep the application running
-    // We can await both handles, though the listener might run indefinitely
-    // or error out.
-    tokio::select! {
-        res = listener_handle => {
-             match res {
-                 Ok(_) => info!("listener task completed."),
-                 Err(e) => error!("listener task panicked or failed: {}", e),
-             }
-        }
-        res = server_handle => {
-            match res {
-                Ok(_) => info!("server task completed."),
-                Err(e) => error!("server task failed: {}", e),
-            }
-        }
-    }
-
-    Ok(())
+    platform::listener_run(tx);
 }
