@@ -175,7 +175,7 @@ dependencies = [
 [[package]]
 name = "cidre"
 version = "0.7.0"
-source = "git+https://github.com/yury/cidre?rev=42ed422#42ed42289dd3a04cb243c0800e30229d13685d9f"
+source = "git+https://github.com/yury/cidre?rev=7ee88d98#7ee88d98c68b238b7134b5b178ba5de0394864ad"
 dependencies = [
  "cidre-macros",
  "parking_lot",
@@ -185,7 +185,7 @@ dependencies = [
 [[package]]
 name = "cidre-macros"
 version = "0.1.0"
-source = "git+https://github.com/yury/cidre?rev=42ed422#42ed42289dd3a04cb243c0800e30229d13685d9f"
+source = "git+https://github.com/yury/cidre?rev=7ee88d98#7ee88d98c68b238b7134b5b178ba5de0394864ad"
 
 [[package]]
 name = "clap"
