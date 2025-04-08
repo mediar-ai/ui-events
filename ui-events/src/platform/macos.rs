@@ -582,7 +582,7 @@ impl MacosListener {
     }
 
     pub fn new_on_main_thread(tx: mpsc::Sender<UiEvent>) -> Result<Pin<Arc<Self>>> {
-        debug_assert!(ns::Thread::is_main());
+        // debug_assert!(ns::Thread::is_main());
         // TODO: assert on main thread
         info!("checking accessibility permissions...");
         if !ax::is_process_trusted_with_prompt(true) {

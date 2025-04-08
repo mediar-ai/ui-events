@@ -32,7 +32,7 @@ pub fn listener_run(tx: mpsc::Sender<UiEvent>) {
 pub fn create_listener() -> Result<Box<dyn PlatformListener>> {
     #[cfg(target_os = "macos")]
     {
-        use macos::MacosListener;
+        // use macos::MacosListener;
         info!("creating macos listener");
         todo!();
         // let listener = MacosListener::new()?;

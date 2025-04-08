@@ -21,7 +21,7 @@ url = "2.5"
 
 # Platform-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]
-cidre = { git = "https://github.com/yury/cidre", rev = "42ed422", features = ["ax", "ns", "cf", "blocks", "app"] }
+cidre = { git = "https://github.com/yury/cidre", branch = "main", features = ["ax", "ns", "cf", "blocks", "app"] }
 chrono = { version = "0.4", features = ["serde"] } # For timestamps
 
 [target.'cfg(target_os = "windows")'.dependencies]
