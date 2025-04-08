@@ -3,9 +3,9 @@
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/your-username/ui-events/rust.yml?branch=main)](https://github.com/your-username/ui-events/actions) [![Crates.io](https://img.shields.io/crates/v/ui-events.svg)](https://crates.io/crates/ui-events) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A cross-platform Rust library designed to capture specific UI interaction events using native operating system accessibility APIs (initially focusing on macOS `AXObserver` capabilities, with planned support for Windows UI Automation and Linux AT-SPI) and stream them over a websocket connection.
+A cross-platform Rust library designed to capture specific UI interaction events using native operating system accessibility APIs (initially focusing on macOS `AXObserver` capabilities, with planned support for Windows UI Automation and Linux AT-SPI) and stream them over a websocket connection for usage with any language.
 
-https://github.com/user-attachments/assets/aed073e4-ec4e-403b-872e-270e0c4802b5
+https://github.com/user-attachments/assets/e014ba45-0ffe-49f9-8a8f-db70884fea2c
 
 ### Motivation
 
@@ -13,7 +13,7 @@ Understanding user interface interactions like focus shifts, window changes, and
 
 `ui-events` aims to provide a performant Rust core that leverages native accessibility APIs, exposing a stream of key UI events via a simple websocket interface accessible from any language (JavaScript, Python, Go, etc.).
 
-### Features (Based on typical `AXObserver` capabilities)
+### Features 
 
 *   **UI Focus:** Captures events like application activation/deactivation, window creation/destruction/movement/resizing, focused UI element changes, and potentially value changes or selection changes within elements.
 *   **Cross-Platform Goal:** Targets macOS, Windows (via UI Automation), and Linux (via AT-SPI).
