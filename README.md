@@ -135,6 +135,14 @@ Events streamed over the websocket follow a consistent JSON structure. The exact
 ```
 *(A detailed `SCHEMA.md` should document the specific events captured on each platform)*
 
+3. **Run the UI Events App:**
+
+```bash
+cd ui-events-app
+bun i
+bun tauri dev
+```
+
 ### Status 
 
 - [x] experimental macOS support
