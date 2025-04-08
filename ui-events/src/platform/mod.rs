@@ -19,14 +19,24 @@ pub trait PlatformListener: Send {
     fn run(&self, sender: mpsc::Sender<UiEvent>) -> Result<()>;
 }
 
+pub fn listener_run(tx: mpsc::Sender<UiEvent>) {
+    #[cfg(target_os = "macos")]
+    {
+        use cidre::ns;
+        macos::MacosListener::new_on_main_thread(tx).unwrap();
+        ns::App::shared().run()
+    }
+}
+
 /// Creates the appropriate platform listener.
 pub fn create_listener() -> Result<Box<dyn PlatformListener>> {
     #[cfg(target_os = "macos")]
     {
         use macos::MacosListener;
         info!("creating macos listener");
-        let listener = MacosListener::new()?;
-        Ok(Box::new(listener))
+        todo!();
+        // let listener = MacosListener::new()?;
+        // Ok(Box::new(listener))
     }
     #[cfg(target_os = "windows")]
     {
